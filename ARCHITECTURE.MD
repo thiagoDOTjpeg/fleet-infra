@@ -180,6 +180,8 @@ erDiagram
         uuid id PK
         uuid driver_id FK "Referência ao entregador"
         uuid order_id "Referência ao pedido (integração externa)"
+        decimal latitude
+        decimal longitude
         geography location "Posição registrada (PostGIS POINT)"
         decimal speed "Velocidade no momento"
         timestamp recorded_at "Data/hora do registro"
@@ -198,6 +200,8 @@ erDiagram
         uuid order_id "Referência ao pedido (integração externa)"
         uuid driver_id FK "Referência ao entregador"
         varchar event_type "Ex: 'pickup', 'delivered'"
+        decimal latitude
+        decimal longitude
         geography location "Localização do evento"
         jsonb metadata "Informações adicionais do evento"
         timestamp created_at "Data/hora do evento"
@@ -244,6 +248,7 @@ erDiagram
         varchar address
         decimal latitude
         decimal longitude
+        geography location "Localização da loja"
         boolean active
     }
 
@@ -274,6 +279,8 @@ erDiagram
         varchar delivery_address
         decimal delivery_latitude
         decimal delivery_longitude
+        geography pickup_location
+        geography delivery_location
         decimal distance_km
         decimal total
         varchar status
