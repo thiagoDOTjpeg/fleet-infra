@@ -10,6 +10,8 @@ services:
     volumes:
       - ./database/init-db.sh:/docker-entrypoint-initdb.d/init-db.sh
       - postgres_data:/var/lib/postgresql/data
+    networks:
+      - fleet-network
 
   redis-fleet:
     image: redis:8.4.0-alpine
@@ -20,6 +22,8 @@ services:
     volumes:
       - redis_data:/data
     command: redis-server --appendonly yes
+    networks:
+      - fleet-network
 
   rabbitmq:
     image: rabbitmq:4.2.1-management-alpine
@@ -33,8 +37,81 @@ services:
       - RABBITMQ_DEFAULT_PASS=password
     volumes:
       - rabbitmq_data:/var/lib/rabbitmq
+    networks:
+      - fleet-network
+
+  auth-service:
+    build: ../services/auth
+    container_name: auth-service
+    ports:
+      - "8081:8080"
+    environment:
+      - DB_HOST=db-postgres
+      - DB_PORT=5432
+      - DB_NAME=db_fleet_orders
+      - DB_USER=user
+      - DB_PASSWORD=password
+
+      - REDIS_HOST=redis-fleet
+      - REDIS_PORT=6379
+      - REDIS_PASSWORD=
+
+      - RABBIT_HOST=rabbitmq-fleet
+      - RABBIT_PORT=5672
+      - RABBIT_PASSWORD=password
+      - RABBIT_USER=user
+
+      - SERVER_PORT=8080
+      - ENVIRONMENT=development
+
+      - JWT_SECRET=ed8887cd43bdf807b4fbb5204628efef8180c6d5093e8da0f2113c0631c6f349
+      - JWT_ISSUER=fleet-auth-service
+      - JWT_AUDIENCE=fleet-platform
+      - JWT_ACCESS_EXPIRATION=900000
+      - JWT_REFRESH_EXPIRATION=604800000
+
+      - CORS_ORIGINS=http://localhost:4200,http://localhost:3000
+
+      - LOG_LEVEL_ROOT=INFO
+      - LOG_LEVEL_APP=DEBUG
+      - LOG_LEVEL_SECURITY=DEBUG
+      - LOG_LEVEL_WEB=INFO
+      - LOG_LEVEL_SQL=DEBUG
+      - LOG_LEVEL_SQL_PARAMS=TRACE
+    networks:
+      - fleet-network
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+
+  api-gateway:
+    image: nginx:alpine
+    container_name: api-gateway
+    ports:
+      - "8080:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - auth-service
+    networks:
+      - fleet-network
+
+  watchtower:
+    image: containrrr/watchtower
+    container_name: watchtower
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - WATCHTOWER_CLEANUP=true
+      - WATCHTOWER_POLL_INTERVAL=60
+    command: --interval 60
+    networks:
+      - fleet-network
 
 volumes:
   postgres_data:
   redis_data:
   rabbitmq_data:
+
+networks:
+  fleet-network:
+    driver: bridge
