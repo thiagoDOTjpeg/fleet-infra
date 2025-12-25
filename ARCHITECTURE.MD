@@ -129,25 +129,27 @@ A escolha segue Polyglot Programming, usando a melhor ferramenta para cada respo
 
 ## 4. Decisões Estratégicas (Key Design Decisions)
 
-### 4.1. Autenticação no Gateway (Token Introspection)
+### 4.1. Autenticação Centralizada (Gateway Offloading)
 
-O Nginx valida o token via auth_request.
+**Decisão:** O Nginx (ou API Gateway) valida o token JWT via sub-request (`auth_request`) antes de encaminhar para os microsserviços.
 
-Servicios internos não precisam validar JWT.
+**Benefício:** Os serviços internos (`fleet-orders`, `fleet-tracking`) não precisam implementar lógica de validação de token, focando apenas no domínio. Permite revogação centralizada e simplifica a gestão de dependências de segurança.
 
-Permite revogação centralizada e menor complexidade.
+### 4.2. Telemetria em Alta Frequência (Write-Behind Pattern)
 
-### 4.2. Telemetria em Alta Frequência (Node.js + PostGIS)
+**Problema:** Milhares de coordenadas de entregadores chegando a cada 3 segundos gerariam gargalo de I/O se fossem inseridas linha a linha no banco.
 
-Problema: milhares de coordenadas chegando a cada 3s → Não fazer INSERT direto.
+**Solução:**
 
-Solução: Write-Behind Pattern
+- **Entrada:** O serviço de Tracking grava no Redis (Geo Set/Lists) para latência sub-milissegundo.
+- **Buffer:** O Redis atua como um buffer temporário de alta velocidade.
+- **Persistência:** Um Cron Job (Worker) coleta esses dados e faz Batch Inserts no PostGIS a cada 60 segundos.
 
-Entrada: Tracking grava no Redis (Geo Set) → latência sub-ms.
+### 4.3. Consistência Eventual e Confiabilidade (Transactional Outbox)
 
-Buffer: Redis armazena coordenadas em lista.
+**Problema:** O risco de "Dual Write" (salvar no banco e falhar ao enviar para o RabbitMQ).
 
-Persistência: Cron job faz batch inserts no PostGIS a cada 60s.
+**Solução:** Implementação do **Transactional Outbox Pattern** no `fleet-auth`. O evento é salvo na mesma transação do banco de dados e um polling publisher garante o envio para o RabbitMQ, assegurando que nenhuma mensagem de negócio seja perdida em caso de falha de rede.
 
 ## 5. Modelagem de Dados
 
@@ -357,30 +359,42 @@ erDiagram
 
 ```
 
-## 6. ADR – Registros de Decisões
+## 6. ADR – Registros de Decisões Arquiteturais
 
-### Redis – Processamento da Localização do Entregador
+### ADR 001: Processamento da Localização do Entregador
 
-**Decisão:** Utilizar processamento em lote (Batch Work).
+**Decisão:** Utilizar processamento em lote (Batch Work) com Redis e PostGIS.
 
-**Justificativa:** O processamento em lote permite agrupar e salvar dados periodicamente, reduzindo a carga sobre o banco de dados e otimizando a performance do sistema.
+**Justificativa:** O volume de escrita de GPS é alto demais para o banco relacional suportar em tempo real (OLTP). O processamento em lote reduz a carga de I/O no disco e evita locks desnecessários na tabela de histórico.
 
-### RabbitMQ vs Kafka
+### ADR 002: Mensageria (RabbitMQ vs Kafka)
 
 **Decisão:** Adotar RabbitMQ.
 
-**Justificativa:** RabbitMQ foi escolhido devido ao suporte para roteamento complexo, confirmação granular de mensagens (ACK), além de apresentar menor complexidade operacional em comparação ao Kafka.
+**Justificativa:** Para o estágio atual e volumetria do `fleet-auth` e notificações, o RabbitMQ oferece menor complexidade operacional, suporte nativo a prioridade e roteamento flexível (exchanges), além de garantir confirmação granular de entrega (ACKs). O Kafka seria overkill e adicionaria complexidade acidental neste momento.
 
-### Separação de Bancos
+### ADR 003: Separação de Bancos de Dados
 
-**Decisão:** Utilizar bancos separados para pedidos (`db_fleet_order`) e rastreamento (`db_fleet_tracking`).
+**Decisão:** Utilizar bases de dados fisicamente separadas para Domínios distintos (`db_fleet_auth`, `db_fleet_orders`, `db_fleet_tracking`).
 
-**Justificativa:** A separação lógica permite escalar o armazenamento e processamento de geodados de forma independente, sem impactar o banco principal de pedidos, garantindo maior flexibilidade e performance para cada tipo de dado.
+**Justificativa:**
 
-## 7. Trade-offs
+- **Isolamento de Falhas:** Um pico de carga no rastreamento não derruba o login dos usuários.
+- **Segurança:** Dados sensíveis (senhas) ficam inacessíveis ao serviço de pedidos.
+- **Escalabilidade:** Permite escalar o hardware do banco de geolocalização (PostGIS) independentemente do banco relacional padrão.
 
-Consistência eventual de até 60s no histórico.
+### ADR 004: Garantia de Entrega (Idempotência)
 
-Dependência forte do Redis (possível perda de 1min de buffer)
+**Decisão:** Consumidores devem ser Idempotentes.
 
-Observabilidade distribuída necessária (Java + Node + PHP).
+**Justificativa:** Devido ao uso do Outbox Pattern e à natureza de redes distribuídas ("at-least-once delivery"), mensagens podem chegar duplicadas. Os serviços consumidores utilizam tabelas de controle ou chaves de negócio únicas para descartar duplicatas silenciosamente.
+
+## 7. Trade-offs (Limitações Aceitas)
+
+- **Consistência Eventual no Histórico:** O trajeto do entregador pode levar até 60 segundos para aparecer no histórico permanente (PostGIS), embora a posição atual (Redis) seja em tempo real.
+
+- **Dependência Crítica do Redis:** Se o Redis falhar e não houver persistência em disco (AOF/RDB) configurada, pode haver perda de até 1 minuto de dados de telemetria (buffer).
+
+- **Complexidade de Observabilidade:** Com a separação em microsserviços e bancos distintos, o rastreamento de erros exige ferramentas de Distributed Tracing (OpenTelemetry/Micrometer) para correlacionar logs entre Java, Node.js e banco de dados.
+
+- **Integridade Referencial:** A separação dos bancos remove as Foreign Keys entre Pedidos e Usuários, exigindo que a consistência seja garantida via aplicação (eventos de compensação).
