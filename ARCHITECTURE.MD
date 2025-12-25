@@ -212,10 +212,61 @@ erDiagram
 
 > Modelagem voltada para pedidos, clientes, lojas e histórico de status. Integração com rastreamento via UUID, snapshots para auditoria e campos explicativos.
 
+#### auth_schema
+
 ```mermaid
 erDiagram
-    USERS ||--o{ SHOPS : owns
-    USERS ||--o{ CLIENTS : "has profile"
+    USERS ||--o{ REFRESH_TOKENS : has
+    USERS ||--o{ USER_ROLES : assigned
+    ROLES ||--o{ USER_ROLES : contains
+
+    USERS {
+        uuid id PK
+        varchar name
+        varchar email
+        varchar password
+        varchar user_type
+        boolean enabled
+        boolean account_non_expired
+        boolean account_non_locked
+        boolean credentials_non_expired
+        timestamp created_at
+        timestamp updated_at
+    }
+
+    ROLES {
+        uuid id PK
+        varchar name
+        timestamp created_at
+    }
+
+    USER_ROLES {
+        uuid user_id PK
+        uuid role_id PK
+        timestamp assigned_at
+    }
+
+    REFRESH_TOKENS {
+        uuid id PK
+        varchar token_hash
+        uuid user_id FK
+        uuid parent_id
+        uuid session_id
+        timestamp expires_at
+        boolean revoked
+        boolean used
+        timestamp created_at
+        timestamp updated_at
+        bigint version
+    }
+```
+
+---
+
+#### orders_schema
+
+```mermaid
+erDiagram
     SHOPS ||--o{ ITEMS : sells
     SHOPS ||--o{ ORDERS : "receives from"
     CLIENTS ||--o{ ORDERS : places
@@ -224,45 +275,36 @@ erDiagram
     ITEMS ||--o{ ORDER_ITEMS : "included in"
     ORDERS ||--o{ ORDER_STATUS_HISTORY : "status changes"
 
-    USERS {
-        uuid id PK
-        varchar name
-        varchar email
-        varchar password
-        varchar user_type "admin, client, shop_owner"
-        boolean active
-    }
-
     PRICING_CONFIG {
         uuid id PK
-        varchar region "Região de precificação"
-        decimal base_fee "Taxa base"
-        decimal price_per_km "Preço por km"
-        decimal surge_multiplier "Multiplicador de demanda"
+        varchar region
+        decimal base_fee
+        decimal price_per_km
+        decimal surge_multiplier
     }
 
     SHOPS {
         uuid id PK
-        uuid owner_id FK "Referência ao usuário dono"
+        uuid owner_user_id "ID do usuário (auth.users)"
         varchar name
         varchar address
         decimal latitude
         decimal longitude
-        geography location "Localização da loja"
+        geography location
         boolean active
     }
 
     CLIENTS {
         uuid id PK
-        uuid user_id FK "Referência ao usuário"
+        uuid user_id "ID do usuário (auth.users)"
         varchar cpf
-        uuid default_payment_method_id "Método de pagamento padrão"
+        uuid default_payment_method_id
         boolean active
     }
 
     ITEMS {
         uuid id PK
-        uuid shop_id FK "Referência à loja"
+        uuid shop_id FK
         varchar name
         decimal price
         boolean active
@@ -270,9 +312,9 @@ erDiagram
 
     ORDERS {
         uuid id PK
-        uuid client_id FK "Referência ao cliente"
-        uuid driver_id "Referência externa (tracking)"
-        uuid shop_id FK "Referência à loja"
+        uuid client_id FK
+        uuid shop_id FK
+        uuid driver_user_id "Usuário externo (auth.users)"
         varchar pickup_address
         decimal pickup_latitude
         decimal pickup_longitude
@@ -284,34 +326,35 @@ erDiagram
         decimal distance_km
         decimal total
         varchar status
-        varchar driver_name "Snapshot para auditoria"
-        varchar driver_phone "Snapshot para auditoria"
+        varchar driver_name
+        varchar driver_phone
     }
 
     PAYMENT_METHODS {
         uuid id PK
-        uuid client_id FK "Referência ao cliente"
-        varchar type "Ex: 'credit_card', 'pix'"
-        varchar card_last4 "Últimos 4 dígitos do cartão"
-        boolean is_default "Indica se é o método padrão"
+        uuid client_id FK
+        varchar type
+        varchar card_last4
+        boolean is_default
     }
 
     ORDER_ITEMS {
         uuid id PK
-        uuid order_id FK "Referência ao pedido"
-        uuid item_id FK "Referência ao item"
-        int quantity "Quantidade"
-        decimal price_at_moment "Preço no momento do pedido"
+        uuid order_id FK
+        uuid item_id FK
+        int quantity
+        decimal price_at_moment
     }
 
     ORDER_STATUS_HISTORY {
         uuid id PK
-        uuid order_id FK "Referência ao pedido"
-        varchar from_status "Status anterior"
-        varchar to_status "Novo status"
-        uuid changed_by_user_id "Usuário que alterou"
-        timestamp changed_at "Data/hora da alteração"
+        uuid order_id FK
+        varchar from_status
+        varchar to_status
+        uuid changed_by_user_id "auth.users (referência lógica)"
+        timestamp changed_at
     }
+
 ```
 
 ## 6. ADR – Registros de Decisões
