@@ -71,33 +71,32 @@ graph TD
         AdminSvc["Backoffice Service (PHP)"]
     end
 
-
     %% --- Conexões ---
-    MobileApp -->|"HTTPS / JSON"| Nginx
-    AdminWeb -->|"HTTPS / JSON"| Nginx
+    MobileApp -->|"HTTPS/JSON (REST)"| Nginx
+    AdminWeb -->|"HTTPS/JSON (REST)"| Nginx
 
-    Nginx -->|"1. Validate Token"| AuthSvc
-    Nginx -->|"2. Proxy Request"| CoreSvc
-    Nginx -->|"2. Proxy Request"| TrackSvc
-    Nginx -->|"2. Proxy Request"| AdminSvc
+    Nginx -->|"HTTP/1.1 (auth_request)"| AuthSvc
+    Nginx -->|"HTTP/1.1 (REST)"| CoreSvc
+    Nginx -->|"HTTP/1.1 (REST)"| TrackSvc
+    Nginx -->|"HTTP/1.1 (REST)"| AdminSvc
 
-    CoreSvc -->|"CRUD"| DB_Core
-    AdminSvc -->|"Read/Write"| DB_Core
+    CoreSvc -->|"TCP/5432 (SQL)"| DB_Core
+    AdminSvc -->|"TCP/5432 (SQL)"| DB_Core
 
     %% Fluxos Assíncronos
-    AuthSvc -.->|"Session Data"| Redis
+    AuthSvc -.->|"RESP Protocol"| Redis
     linkStyle 8 stroke:#1565c0,stroke-width:2px,stroke-dasharray: 5 5;
 
-    CoreSvc -.->|"Pub: OrderCreated"| RabbitMQ
+    CoreSvc -.->|"AMQP 0-9-1 (Pub)"| RabbitMQ
     linkStyle 9 stroke:#f57f17,stroke-width:2px,stroke-dasharray: 5 5;
 
-    RabbitMQ -.->|"Sub: CreateTracking"| TrackSvc
+    RabbitMQ -.->|"AMQP 0-9-1 (Sub)"| TrackSvc
     linkStyle 10 stroke:#f57f17,stroke-width:2px,stroke-dasharray: 5 5;
 
-    TrackSvc -.->|"1. Hot Write (Geo)"| Redis
+    TrackSvc -.->|"RESP Protocol (GEOADD)"| Redis
     linkStyle 11 stroke:#2e7d32,stroke-width:2px,stroke-dasharray: 5 5;
 
-    TrackSvc --->|"2. Batch Write (Cron)"| DB_Geo
+    TrackSvc --->|"TCP/5432 (Batch Insert)"| DB_Geo
 
     class MobileApp,AdminWeb frontend;
     class Nginx gateway;
@@ -116,38 +115,45 @@ A escolha segue Polyglot Programming, usando a melhor ferramenta para cada respo
 
 ### Componentes, Tecnologias e Responsabilidades
 
-| Componente       | Tecnologia           | Responsabilidade                                  |
-| :--------------- | :------------------- | :------------------------------------------------ |
-| API Gateway      | Nginx                | Roteamento, SSL, Rate Limiting                    |
-| Auth Service     | Java (Spring Boot)   | Autenticação e JWT                                |
-| Core Service     | Java (Spring Boot)   | Pedidos e pagamentos                              |
-| Tracking Service | Node.js (NestJS)     | Telemetria e geo-cálculos                         |
-| Backoffice       | PHP                  | Administração e relatórios                        |
-| Bancos           | PostgreSQL + PostGIS | Dados relacionais e espaciais                     |
-| Cache/Buffer     | Redis                | Cache, geolocalização em tempo real, write-behind |
-| Mensageria       | RabbitMQ             | Comunicação assíncrona                            |
+| Componente       | Tecnologia              | Responsabilidade                                  |
+| :--------------- | :---------------------- | :------------------------------------------------ |
+| API Gateway      | Nginx                   | Roteamento, SSL, Rate Limiting                    |
+| Auth Service     | Java (Spring Boot)      | Autenticação e JWT                                |
+| Core Service     | Java (Spring Boot)      | Pedidos e pagamentos                              |
+| Tracking Service | Node.js (NestJS)        | Telemetria e geo-cálculos                         |
+| Backoffice       | PHP                     | Administração e relatórios                        |
+| Bancos           | PostgreSQL + PostGIS    | Dados relacionais e espaciais                     |
+| Cache/Buffer     | Redis                   | Cache, geolocalização em tempo real, write-behind |
+| Mensageria       | RabbitMQ                | Comunicação assíncrona (AMQP 0-9-1)               |
+| Observabilidade  | Prometheus + Grafana    | Métricas, dashboards e alertas                    |
+| Logs             | Loki + Promtail         | Agregação centralizada de logs                    |
+| Tracing          | OpenTelemetry           | Distributed tracing entre serviços                |
+| CI/CD            | GitHub Actions + Docker | Build, testes e deploy automatizado               |
+| Registry         | Docker Hub + Watchtower | Distribuição de imagens e auto-update             |
 
 ## 4. Decisões Estratégicas (Key Design Decisions)
 
-### 4.1. Autenticação no Gateway (Token Introspection)
+### 4.1. Autenticação Centralizada (Gateway Offloading)
 
-O Nginx valida o token via auth_request.
+**Decisão:** O Nginx (ou API Gateway) valida o token JWT via sub-request (`auth_request`) antes de encaminhar para os microsserviços.
 
-Servicios internos não precisam validar JWT.
+**Benefício:** Os serviços internos (`fleet-orders`, `fleet-tracking`) não precisam implementar lógica de validação de token, focando apenas no domínio. Permite revogação centralizada e simplifica a gestão de dependências de segurança.
 
-Permite revogação centralizada e menor complexidade.
+### 4.2. Telemetria em Alta Frequência (Write-Behind Pattern)
 
-### 4.2. Telemetria em Alta Frequência (Node.js + PostGIS)
+**Problema:** Milhares de coordenadas de entregadores chegando a cada 3 segundos gerariam gargalo de I/O se fossem inseridas linha a linha no banco.
 
-Problema: milhares de coordenadas chegando a cada 3s → Não fazer INSERT direto.
+**Solução:**
 
-Solução: Write-Behind Pattern
+- **Entrada:** O serviço de Tracking grava no Redis (Geo Set/Lists) para latência sub-milissegundo.
+- **Buffer:** O Redis atua como um buffer temporário de alta velocidade.
+- **Persistência:** Um Cron Job (Worker) coleta esses dados e faz Batch Inserts no PostGIS a cada 60 segundos.
 
-Entrada: Tracking grava no Redis (Geo Set) → latência sub-ms.
+### 4.3. Consistência Eventual e Confiabilidade (Transactional Outbox)
 
-Buffer: Redis armazena coordenadas em lista.
+**Problema:** O risco de "Dual Write" (salvar no banco e falhar ao enviar para o RabbitMQ).
 
-Persistência: Cron job faz batch inserts no PostGIS a cada 60s.
+**Solução:** Implementação do **Transactional Outbox Pattern** no `fleet-auth`. O evento é salvo na mesma transação do banco de dados e um polling publisher garante o envio para o RabbitMQ, assegurando que nenhuma mensagem de negócio seja perdida em caso de falha de rede.
 
 ## 5. Modelagem de Dados
 
@@ -212,10 +218,61 @@ erDiagram
 
 > Modelagem voltada para pedidos, clientes, lojas e histórico de status. Integração com rastreamento via UUID, snapshots para auditoria e campos explicativos.
 
+#### auth_schema
+
 ```mermaid
 erDiagram
-    USERS ||--o{ SHOPS : owns
-    USERS ||--o{ CLIENTS : "has profile"
+    USERS ||--o{ REFRESH_TOKENS : has
+    USERS ||--o{ USER_ROLES : assigned
+    ROLES ||--o{ USER_ROLES : contains
+
+    USERS {
+        uuid id PK
+        varchar name
+        varchar email
+        varchar password
+        varchar user_type
+        boolean enabled
+        boolean account_non_expired
+        boolean account_non_locked
+        boolean credentials_non_expired
+        timestamp created_at
+        timestamp updated_at
+    }
+
+    ROLES {
+        uuid id PK
+        varchar name
+        timestamp created_at
+    }
+
+    USER_ROLES {
+        uuid user_id PK
+        uuid role_id PK
+        timestamp assigned_at
+    }
+
+    REFRESH_TOKENS {
+        uuid id PK
+        varchar token_hash
+        uuid user_id FK
+        uuid parent_id
+        uuid session_id
+        timestamp expires_at
+        boolean revoked
+        boolean used
+        timestamp created_at
+        timestamp updated_at
+        bigint version
+    }
+```
+
+---
+
+#### orders_schema
+
+```mermaid
+erDiagram
     SHOPS ||--o{ ITEMS : sells
     SHOPS ||--o{ ORDERS : "receives from"
     CLIENTS ||--o{ ORDERS : places
@@ -224,45 +281,36 @@ erDiagram
     ITEMS ||--o{ ORDER_ITEMS : "included in"
     ORDERS ||--o{ ORDER_STATUS_HISTORY : "status changes"
 
-    USERS {
-        uuid id PK
-        varchar name
-        varchar email
-        varchar password
-        varchar user_type "admin, client, shop_owner"
-        boolean active
-    }
-
     PRICING_CONFIG {
         uuid id PK
-        varchar region "Região de precificação"
-        decimal base_fee "Taxa base"
-        decimal price_per_km "Preço por km"
-        decimal surge_multiplier "Multiplicador de demanda"
+        varchar region
+        decimal base_fee
+        decimal price_per_km
+        decimal surge_multiplier
     }
 
     SHOPS {
         uuid id PK
-        uuid owner_id FK "Referência ao usuário dono"
+        uuid owner_user_id "ID do usuário (auth.users)"
         varchar name
         varchar address
         decimal latitude
         decimal longitude
-        geography location "Localização da loja"
+        geography location
         boolean active
     }
 
     CLIENTS {
         uuid id PK
-        uuid user_id FK "Referência ao usuário"
+        uuid user_id "ID do usuário (auth.users)"
         varchar cpf
-        uuid default_payment_method_id "Método de pagamento padrão"
+        uuid default_payment_method_id
         boolean active
     }
 
     ITEMS {
         uuid id PK
-        uuid shop_id FK "Referência à loja"
+        uuid shop_id FK
         varchar name
         decimal price
         boolean active
@@ -270,9 +318,9 @@ erDiagram
 
     ORDERS {
         uuid id PK
-        uuid client_id FK "Referência ao cliente"
-        uuid driver_id "Referência externa (tracking)"
-        uuid shop_id FK "Referência à loja"
+        uuid client_id FK
+        uuid shop_id FK
+        uuid driver_user_id "Usuário externo (auth.users)"
         varchar pickup_address
         decimal pickup_latitude
         decimal pickup_longitude
@@ -284,60 +332,139 @@ erDiagram
         decimal distance_km
         decimal total
         varchar status
-        varchar driver_name "Snapshot para auditoria"
-        varchar driver_phone "Snapshot para auditoria"
+        varchar driver_name
+        varchar driver_phone
     }
 
     PAYMENT_METHODS {
         uuid id PK
-        uuid client_id FK "Referência ao cliente"
-        varchar type "Ex: 'credit_card', 'pix'"
-        varchar card_last4 "Últimos 4 dígitos do cartão"
-        boolean is_default "Indica se é o método padrão"
+        uuid client_id FK
+        varchar type
+        varchar card_last4
+        boolean is_default
     }
 
     ORDER_ITEMS {
         uuid id PK
-        uuid order_id FK "Referência ao pedido"
-        uuid item_id FK "Referência ao item"
-        int quantity "Quantidade"
-        decimal price_at_moment "Preço no momento do pedido"
+        uuid order_id FK
+        uuid item_id FK
+        int quantity
+        decimal price_at_moment
     }
 
     ORDER_STATUS_HISTORY {
         uuid id PK
-        uuid order_id FK "Referência ao pedido"
-        varchar from_status "Status anterior"
-        varchar to_status "Novo status"
-        uuid changed_by_user_id "Usuário que alterou"
-        timestamp changed_at "Data/hora da alteração"
+        uuid order_id FK
+        varchar from_status
+        varchar to_status
+        uuid changed_by_user_id "auth.users (referência lógica)"
+        timestamp changed_at
     }
+
 ```
 
-## 6. ADR – Registros de Decisões
+## 6. ADR – Registros de Decisões Arquiteturais
 
-### Redis – Processamento da Localização do Entregador
+### ADR 001: Processamento da Localização do Entregador
 
-**Decisão:** Utilizar processamento em lote (Batch Work).
+**Decisão:** Utilizar processamento em lote (Batch Work) com Redis e PostGIS.
 
-**Justificativa:** O processamento em lote permite agrupar e salvar dados periodicamente, reduzindo a carga sobre o banco de dados e otimizando a performance do sistema.
+**Justificativa:** O volume de escrita de GPS é alto demais para o banco relacional suportar em tempo real (OLTP). O processamento em lote reduz a carga de I/O no disco e evita locks desnecessários na tabela de histórico.
 
-### RabbitMQ vs Kafka
+### ADR 002: Mensageria (RabbitMQ vs Kafka)
 
 **Decisão:** Adotar RabbitMQ.
 
-**Justificativa:** RabbitMQ foi escolhido devido ao suporte para roteamento complexo, confirmação granular de mensagens (ACK), além de apresentar menor complexidade operacional em comparação ao Kafka.
+**Justificativa:** Para o estágio atual e volumetria do `fleet-auth` e notificações, o RabbitMQ oferece menor complexidade operacional, suporte nativo a prioridade e roteamento flexível (exchanges), além de garantir confirmação granular de entrega (ACKs). O Kafka seria overkill e adicionaria complexidade acidental neste momento.
 
-### Separação de Bancos
+### ADR 003: Separação de Bancos de Dados
 
-**Decisão:** Utilizar bancos separados para pedidos (`db_fleet_order`) e rastreamento (`db_fleet_tracking`).
+**Decisão:** Utilizar bases de dados fisicamente separadas para Domínios distintos (`db_fleet_auth`, `db_fleet_orders`, `db_fleet_tracking`).
 
-**Justificativa:** A separação lógica permite escalar o armazenamento e processamento de geodados de forma independente, sem impactar o banco principal de pedidos, garantindo maior flexibilidade e performance para cada tipo de dado.
+**Justificativa:**
 
-## 7. Trade-offs
+- **Isolamento de Falhas:** Um pico de carga no rastreamento não derruba o login dos usuários.
+- **Segurança:** Dados sensíveis (senhas) ficam inacessíveis ao serviço de pedidos.
+- **Escalabilidade:** Permite escalar o hardware do banco de geolocalização (PostGIS) independentemente do banco relacional padrão.
 
-Consistência eventual de até 60s no histórico.
+**Consistência e Integridade Referencial:**
 
-Dependência forte do Redis (possível perda de 1min de buffer)
+A separação física dos bancos remove as Foreign Keys entre domínios (ex: Pedidos → Usuários). A integridade referencial é garantida logicamente via aplicação através do padrão **Saga Choreography**: eventos de domínio (`UserDeleted`, `OrderCancelled`) são propagados via RabbitMQ, e cada serviço executa ações de compensação quando necessário (soft-delete, anonimização de dados órfãos).
 
-Observabilidade distribuída necessária (Java + Node + PHP).
+### ADR 004: Garantia de Entrega (Idempotência)
+
+**Decisão:** Consumidores devem ser Idempotentes.
+
+**Justificativa:** Devido ao uso do Outbox Pattern e à natureza de redes distribuídas ("at-least-once delivery"), mensagens podem chegar duplicadas. Os serviços consumidores utilizam tabelas de controle ou chaves de negócio únicas para descartar duplicatas silenciosamente.
+
+## 7. Trade-offs (Limitações Aceitas)
+
+- **Consistência Eventual no Histórico:** O trajeto do entregador pode levar até 60 segundos para aparecer no histórico permanente (PostGIS), embora a posição atual (Redis) seja em tempo real.
+
+- **Dependência Crítica do Redis:** Se o Redis falhar e não houver persistência em disco (AOF/RDB) configurada, pode haver perda de até 1 minuto de dados de telemetria (buffer).
+
+- **Complexidade de Observabilidade:** Com a separação em microsserviços e bancos distintos, o rastreamento de erros exige ferramentas de Distributed Tracing (OpenTelemetry/Micrometer) para correlacionar logs entre Java, Node.js e banco de dados.
+
+- **Integridade Referencial:** A separação dos bancos remove as Foreign Keys entre Pedidos e Usuários, exigindo que a consistência seja garantida via aplicação (eventos de compensação).
+
+---
+
+## 8. Mitigação de Riscos e Roadmap de Evolução
+
+Esta seção documenta as estratégias de mitigação para os trade-offs aceitos e o caminho evolutivo para ambientes de maior criticidade.
+
+### 8.1. Eliminação de Perda de Dados de Telemetria (Zero-Loss)
+
+**Risco Atual:** Perda de até 60 segundos de coordenadas GPS em caso de falha do Redis.
+
+**Mitigação Planejada:** Para ambientes de missão crítica (como aviação ou logística de alto valor), a arquitetura prevê evolução para um padrão de **Redundância de Escrita Dual-Path**:
+
+```mermaid
+graph LR
+    TrackSvc["Tracking Service"] -->|"1. Hot Path (sync)"| Redis[("Redis")]
+    TrackSvc -->|"2. Durable Path (async)"| Kafka[("Kafka/RabbitMQ Durable")]
+    Kafka -->|"Consumer"| PostGIS[("PostGIS")]
+    Redis -->|"Batch Job"| PostGIS
+```
+
+- **Hot Path:** Escrita síncrona no Redis para leitura em tempo real (latência < 1ms).
+- **Durable Path:** Escrita assíncrona em fila durável (Kafka com `acks=all` ou RabbitMQ com `persistent=true`).
+- **Resultado:** Mesmo com falha total do Redis, nenhum dado de telemetria é perdido, mantendo a latência de leitura inalterada.
+
+### 8.2. Alta Disponibilidade do Redis
+
+**Mitigação Atual:**
+
+- Redis configurado com AOF (Append-Only File) para persistência.
+- Snapshots RDB a cada 5 minutos.
+
+**Evolução Planejada:**
+
+- Deploy em modo **Redis Sentinel** (3 nós) para failover automático.
+- Migração futura para **Redis Cluster** em caso de crescimento horizontal.
+
+### 8.3. Observabilidade Distribuída
+
+**Status Atual:**
+
+- Logs estruturados (JSON) com correlation ID propagado via headers HTTP.
+- Métricas expostas via Micrometer (Spring Boot) e prom-client (Node.js).
+
+**Evolução Planejada:**
+
+- Implementação completa de **OpenTelemetry Collector** para traces distribuídos.
+- Dashboards Grafana com SLOs (Service Level Objectives) e alertas automáticos.
+- Integração com PagerDuty/Opsgenie para on-call rotation.
+
+### 8.4. Resiliência de Mensageria
+
+**Mitigação Atual:**
+
+- RabbitMQ com filas duráveis e `publisher confirms`.
+- Transactional Outbox Pattern no Auth Service.
+
+**Evolução Planejada:**
+
+- Dead Letter Queues (DLQ) com retry exponencial e alertas.
+- Circuit Breaker (Resilience4j) para chamadas síncronas entre serviços.
+- Fallback graceful em caso de indisponibilidade de serviços downstream.

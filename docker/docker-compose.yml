@@ -41,7 +41,7 @@ services:
       - fleet-network
 
   auth-service:
-    build: ../services/auth
+    build: ../../fleet-auth
     container_name: auth-service
     ports:
       - "8081:8080"
@@ -78,6 +78,10 @@ services:
       - LOG_LEVEL_WEB=INFO
       - LOG_LEVEL_SQL=DEBUG
       - LOG_LEVEL_SQL_PARAMS=TRACE
+    depends_on:
+      - db-postgres
+      - redis-fleet
+      - rabbitmq
     networks:
       - fleet-network
     labels:
