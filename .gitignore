@@ -27,4 +27,5 @@ yarn-error.log*
 .docker/
 
 # --- Documentação Local ---
+node_modules/
 TODO.md

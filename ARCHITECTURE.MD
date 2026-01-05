@@ -71,33 +71,32 @@ graph TD
         AdminSvc["Backoffice Service (PHP)"]
     end
 
-
     %% --- Conexões ---
-    MobileApp -->|"HTTPS / JSON"| Nginx
-    AdminWeb -->|"HTTPS / JSON"| Nginx
+    MobileApp -->|"HTTPS/JSON (REST)"| Nginx
+    AdminWeb -->|"HTTPS/JSON (REST)"| Nginx
 
-    Nginx -->|"1. Validate Token"| AuthSvc
-    Nginx -->|"2. Proxy Request"| CoreSvc
-    Nginx -->|"2. Proxy Request"| TrackSvc
-    Nginx -->|"2. Proxy Request"| AdminSvc
+    Nginx -->|"HTTP/1.1 (auth_request)"| AuthSvc
+    Nginx -->|"HTTP/1.1 (REST)"| CoreSvc
+    Nginx -->|"HTTP/1.1 (REST)"| TrackSvc
+    Nginx -->|"HTTP/1.1 (REST)"| AdminSvc
 
-    CoreSvc -->|"CRUD"| DB_Core
-    AdminSvc -->|"Read/Write"| DB_Core
+    CoreSvc -->|"TCP/5432 (SQL)"| DB_Core
+    AdminSvc -->|"TCP/5432 (SQL)"| DB_Core
 
     %% Fluxos Assíncronos
-    AuthSvc -.->|"Session Data"| Redis
+    AuthSvc -.->|"RESP Protocol"| Redis
     linkStyle 8 stroke:#1565c0,stroke-width:2px,stroke-dasharray: 5 5;
 
-    CoreSvc -.->|"Pub: OrderCreated"| RabbitMQ
+    CoreSvc -.->|"AMQP 0-9-1 (Pub)"| RabbitMQ
     linkStyle 9 stroke:#f57f17,stroke-width:2px,stroke-dasharray: 5 5;
 
-    RabbitMQ -.->|"Sub: CreateTracking"| TrackSvc
+    RabbitMQ -.->|"AMQP 0-9-1 (Sub)"| TrackSvc
     linkStyle 10 stroke:#f57f17,stroke-width:2px,stroke-dasharray: 5 5;
 
-    TrackSvc -.->|"1. Hot Write (Geo)"| Redis
+    TrackSvc -.->|"RESP Protocol (GEOADD)"| Redis
     linkStyle 11 stroke:#2e7d32,stroke-width:2px,stroke-dasharray: 5 5;
 
-    TrackSvc --->|"2. Batch Write (Cron)"| DB_Geo
+    TrackSvc --->|"TCP/5432 (Batch Insert)"| DB_Geo
 
     class MobileApp,AdminWeb frontend;
     class Nginx gateway;
@@ -116,16 +115,21 @@ A escolha segue Polyglot Programming, usando a melhor ferramenta para cada respo
 
 ### Componentes, Tecnologias e Responsabilidades
 
-| Componente       | Tecnologia           | Responsabilidade                                  |
-| :--------------- | :------------------- | :------------------------------------------------ |
-| API Gateway      | Nginx                | Roteamento, SSL, Rate Limiting                    |
-| Auth Service     | Java (Spring Boot)   | Autenticação e JWT                                |
-| Core Service     | Java (Spring Boot)   | Pedidos e pagamentos                              |
-| Tracking Service | Node.js (NestJS)     | Telemetria e geo-cálculos                         |
-| Backoffice       | PHP                  | Administração e relatórios                        |
-| Bancos           | PostgreSQL + PostGIS | Dados relacionais e espaciais                     |
-| Cache/Buffer     | Redis                | Cache, geolocalização em tempo real, write-behind |
-| Mensageria       | RabbitMQ             | Comunicação assíncrona                            |
+| Componente       | Tecnologia              | Responsabilidade                                  |
+| :--------------- | :---------------------- | :------------------------------------------------ |
+| API Gateway      | Nginx                   | Roteamento, SSL, Rate Limiting                    |
+| Auth Service     | Java (Spring Boot)      | Autenticação e JWT                                |
+| Core Service     | Java (Spring Boot)      | Pedidos e pagamentos                              |
+| Tracking Service | Node.js (NestJS)        | Telemetria e geo-cálculos                         |
+| Backoffice       | PHP                     | Administração e relatórios                        |
+| Bancos           | PostgreSQL + PostGIS    | Dados relacionais e espaciais                     |
+| Cache/Buffer     | Redis                   | Cache, geolocalização em tempo real, write-behind |
+| Mensageria       | RabbitMQ                | Comunicação assíncrona (AMQP 0-9-1)               |
+| Observabilidade  | Prometheus + Grafana    | Métricas, dashboards e alertas                    |
+| Logs             | Loki + Promtail         | Agregação centralizada de logs                    |
+| Tracing          | OpenTelemetry           | Distributed tracing entre serviços                |
+| CI/CD            | GitHub Actions + Docker | Build, testes e deploy automatizado               |
+| Registry         | Docker Hub + Watchtower | Distribuição de imagens e auto-update             |
 
 ## 4. Decisões Estratégicas (Key Design Decisions)
 
@@ -383,6 +387,10 @@ erDiagram
 - **Segurança:** Dados sensíveis (senhas) ficam inacessíveis ao serviço de pedidos.
 - **Escalabilidade:** Permite escalar o hardware do banco de geolocalização (PostGIS) independentemente do banco relacional padrão.
 
+**Consistência e Integridade Referencial:**
+
+A separação física dos bancos remove as Foreign Keys entre domínios (ex: Pedidos → Usuários). A integridade referencial é garantida logicamente via aplicação através do padrão **Saga Choreography**: eventos de domínio (`UserDeleted`, `OrderCancelled`) são propagados via RabbitMQ, e cada serviço executa ações de compensação quando necessário (soft-delete, anonimização de dados órfãos).
+
 ### ADR 004: Garantia de Entrega (Idempotência)
 
 **Decisão:** Consumidores devem ser Idempotentes.
@@ -398,3 +406,65 @@ erDiagram
 - **Complexidade de Observabilidade:** Com a separação em microsserviços e bancos distintos, o rastreamento de erros exige ferramentas de Distributed Tracing (OpenTelemetry/Micrometer) para correlacionar logs entre Java, Node.js e banco de dados.
 
 - **Integridade Referencial:** A separação dos bancos remove as Foreign Keys entre Pedidos e Usuários, exigindo que a consistência seja garantida via aplicação (eventos de compensação).
+
+---
+
+## 8. Mitigação de Riscos e Roadmap de Evolução
+
+Esta seção documenta as estratégias de mitigação para os trade-offs aceitos e o caminho evolutivo para ambientes de maior criticidade.
+
+### 8.1. Eliminação de Perda de Dados de Telemetria (Zero-Loss)
+
+**Risco Atual:** Perda de até 60 segundos de coordenadas GPS em caso de falha do Redis.
+
+**Mitigação Planejada:** Para ambientes de missão crítica (como aviação ou logística de alto valor), a arquitetura prevê evolução para um padrão de **Redundância de Escrita Dual-Path**:
+
+```mermaid
+graph LR
+    TrackSvc["Tracking Service"] -->|"1. Hot Path (sync)"| Redis[("Redis")]
+    TrackSvc -->|"2. Durable Path (async)"| Kafka[("Kafka/RabbitMQ Durable")]
+    Kafka -->|"Consumer"| PostGIS[("PostGIS")]
+    Redis -->|"Batch Job"| PostGIS
+```
+
+- **Hot Path:** Escrita síncrona no Redis para leitura em tempo real (latência < 1ms).
+- **Durable Path:** Escrita assíncrona em fila durável (Kafka com `acks=all` ou RabbitMQ com `persistent=true`).
+- **Resultado:** Mesmo com falha total do Redis, nenhum dado de telemetria é perdido, mantendo a latência de leitura inalterada.
+
+### 8.2. Alta Disponibilidade do Redis
+
+**Mitigação Atual:**
+
+- Redis configurado com AOF (Append-Only File) para persistência.
+- Snapshots RDB a cada 5 minutos.
+
+**Evolução Planejada:**
+
+- Deploy em modo **Redis Sentinel** (3 nós) para failover automático.
+- Migração futura para **Redis Cluster** em caso de crescimento horizontal.
+
+### 8.3. Observabilidade Distribuída
+
+**Status Atual:**
+
+- Logs estruturados (JSON) com correlation ID propagado via headers HTTP.
+- Métricas expostas via Micrometer (Spring Boot) e prom-client (Node.js).
+
+**Evolução Planejada:**
+
+- Implementação completa de **OpenTelemetry Collector** para traces distribuídos.
+- Dashboards Grafana com SLOs (Service Level Objectives) e alertas automáticos.
+- Integração com PagerDuty/Opsgenie para on-call rotation.
+
+### 8.4. Resiliência de Mensageria
+
+**Mitigação Atual:**
+
+- RabbitMQ com filas duráveis e `publisher confirms`.
+- Transactional Outbox Pattern no Auth Service.
+
+**Evolução Planejada:**
+
+- Dead Letter Queues (DLQ) com retry exponencial e alertas.
+- Circuit Breaker (Resilience4j) para chamadas síncronas entre serviços.
+- Fallback graceful em caso de indisponibilidade de serviços downstream.
